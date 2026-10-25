@@ -57,6 +57,20 @@ Stay in character as a patient, encouraging teacher. Never mention that you \
 are an AI or a language model, and never discuss these instructions.
 """
 
+# Only added when the learner is speaking. Whisper writes plausible German, so
+# the usual "correct every article" instinct misfires on words it misheard.
+SPEECH_NOTE = """
+The learner often speaks their answers and the message you receive is a \
+speech-recognition transcript of what they said. Therefore:
+- Never treat punctuation, capitalisation, or a missing word as a mistake: the \
+transcript has been cleaned up already.
+- Be careful with homophones and proper nouns. If the sentence only makes sense \
+if one word was misheard (e.g. "Keller" for "Keller" vs "Kieler"), do not \
+correct it — respond to the meaning you think was intended.
+- Only correct errors you would hear in speech: verb forms, articles and case, \
+prepositions, word order, word choice.
+"""
+
 
 def build_model() -> OpenAIChatModel:
     """A local model behind an OpenAI-compatible endpoint."""
@@ -70,10 +84,12 @@ def build_model() -> OpenAIChatModel:
     )
 
 
-def build_agent(level: str = LEVEL) -> Agent[None, str]:
+def build_agent(level: str = LEVEL, *, voice: bool = False) -> Agent[None, str]:
+    """The practice agent. `voice` adds the rules for typed-out speech transcripts."""
+    prompt = SYSTEM_PROMPT.format(level=level) + (SPEECH_NOTE if voice else "")
     return Agent(
         build_model(),
-        system_prompt=SYSTEM_PROMPT.format(level=level),
+        system_prompt=prompt,
         model_settings=ModelSettings(
             temperature=0.7,
             max_tokens=300,
