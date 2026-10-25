@@ -2,13 +2,17 @@
 
 Design notes
 ------------
-* **faster-whisper** (CTranslate2) runs Whisper on the CPU. No cloud, no API key,
-  ~140 MB for `base`, ~460 MB for `small` on disk; int8 halves that in RAM.
-  The model is downloaded once from Hugging Face and then works offline.
-* We ask Whisper for **word timestamps**, not just a transcript. Timings give us
+* **Whistle** (Cactus Compute) is a 16.9 MB speech model in a single `.cact`
+  file on the CPU, driven by a small native engine. No GPU, no cloud, no API
+  key. Engine and weights are fetched once from Hugging Face into
+  `~/.cache/cactus-needle/` and then work offline.
+* We ask Whistle for **word timestamps**, not just a transcript. Timings give us
   speaking pace and pauses; per-word probabilities give us the words the
   recogniser was unsure about. That is what makes feedback possible from a
   recogniser that is otherwise a black box.
+* One pass covers 30 s of audio. Longer clips are windowed by the engine, which
+  cuts at the last full sentence, so `MAX_SECONDS` is clamped there: a take is
+  short by design and we would rather cap it than lose its middle.
 * Honest caveat: an ASR probability is *not* a pronunciation score. A word can
   be low-confidence because the microphone was far away, because the word is
   rare, or because the learner said it wrong. So the feedback we surface is
@@ -32,11 +36,11 @@ if TYPE_CHECKING:  # numpy is only needed once we touch the microphone
 
 SAMPLE_RATE = 16_000
 BLOCK = 1024  # 64 ms per callback: small enough to stop on silence promptly
-MODEL_SIZE = os.getenv("GERMAN_BOT_STT_MODEL", "small")
-COMPUTE_TYPE = os.getenv("GERMAN_BOT_STT_COMPUTE", "int8")
-# Below this per-word probability we flag the word. Whisper is usually 0.9+
-# on clear speech, so 0.55 is deliberately conservative: we only point at words
-# the recogniser genuinely stumbled on.
+# A tuned `whistle.cact`; unset runs the published weights.
+WEIGHTS = os.getenv("GERMAN_BOT_STT_WEIGHTS") or None
+# Below this per-word probability we flag the word. Whistle is usually 0.9+ on
+# clear speech, so 0.55 is deliberately conservative: we only point at words the
+# recogniser genuinely stumbled on.
 CONFIDENCE = float(os.getenv("GERMAN_BOT_STT_CONFIDENCE", "0.55"))
 # A gap longer than this between two words counts as a hesitation.
 PAUSE = 0.6
@@ -44,7 +48,12 @@ PAUSE = 0.6
 # Recording guards.
 LEAD_IN = 4.0  # seconds to wait for the learner to start talking
 SILENCE = float(os.getenv("GERMAN_BOT_STT_SILENCE", "1.8"))
-MAX_SECONDS = float(os.getenv("GERMAN_BOT_STT_MAX_SECONDS", "20"))
+MAX_SECONDS = min(float(os.getenv("GERMAN_BOT_STT_MAX_SECONDS", "20")), 30.0)
+
+# The app promises no network after setup; the engine would otherwise post an
+# anonymous usage count per transcription. Set before `needle` is imported.
+os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+os.environ.setdefault("DO_NOT_TRACK", "1")
 
 
 class STTError(RuntimeError):
@@ -110,24 +119,24 @@ class Transcript:
 
         wpm = self.wpm
         if wpm == 0:
-            pace = "zu kurz für ein Tempo"
+            pace = "too short for a pace"
         elif wpm < 60:
-            pace = f"{wpm:.0f} Wörter/Min — etwas stockend"
+            pace = f"{wpm:.0f} words/min — a bit halting"
         elif wpm > 165:
-            pace = f"{wpm:.0f} Wörter/Min — recht schnell"
+            pace = f"{wpm:.0f} words/min — quite fast"
         else:
-            pace = f"{wpm:.0f} Wörter/Min — gutes Tempo"
+            pace = f"{wpm:.0f} words/min — good pace"
         out.append((pace, "dim"))
 
         longest = self.pauses()
         if longest and longest[0] >= 1.0:
-            out.append((f"längste Pause {longest[0]:.1f} s", "dim"))
+            out.append((f"longest pause {longest[0]:.1f} s", "dim"))
 
         unsure = self.uncertain(threshold)
         if unsure:
             words = ", ".join(w.text.strip(".,!?;:…") for w in unsure[:3])
             more = "" if len(unsure) <= 3 else f" (+{len(unsure) - 3})"
-            out.append((f"unklar: {words}{more}", "yellow"))
+            out.append((f"unclear: {words}{more}", "yellow"))
         return out
 
 
@@ -151,7 +160,7 @@ def record() -> np.ndarray:
         import numpy as np
         import sounddevice as sd
     except ImportError as exc:  # pragma: no cover - environment dependent
-        raise STTError("sounddevice fehlt: `uv add sounddevice`") from exc
+        raise STTError("sounddevice is missing: `uv add sounddevice`") from exc
 
     frames: list = []
 
@@ -188,7 +197,7 @@ def record() -> np.ndarray:
                     if loud > threshold:
                         speech_at = last_loud_at = now
                     elif now > LEAD_IN:
-                        raise NoSpeechError("keine Sprache erkannt")
+                        raise NoSpeechError("no speech detected")
                 elif loud > threshold:
                     last_loud_at = now
                 elif now - last_loud_at > SILENCE:
@@ -198,11 +207,11 @@ def record() -> np.ndarray:
                     break
 
         if not frames or not speech_at:
-            raise NoSpeechError("keine Sprache erkannt")
+            raise NoSpeechError("no speech detected")
     except STTError:
         raise
     except Exception as exc:  # PortAudioError: no mic, or macOS said no
-        raise STTError(f"Mikrofon nicht verfügbar: {exc}") from exc
+        raise STTError(f"microphone unavailable: {exc}") from exc
 
     audio = np.concatenate(frames)
     # Trim the lead-in and the trailing silence we waited out.
@@ -216,63 +225,56 @@ def record() -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # transcription
 # --------------------------------------------------------------------------- #
-_models: dict[str, object] = {}
-
-
-def _model(size: str = MODEL_SIZE):
-    """Whisper is heavy to load, so keep one instance per size for the session."""
-    from faster_whisper import WhisperModel  # imported lazily: slow dependency
-
-    if size not in _models:
-        _models[size] = WhisperModel(
-            size,
-            device="cpu",  # Metal is not wired up in CTranslate2; CPU is fine here
-            compute_type=COMPUTE_TYPE,
-            # Small utterances: a few decode threads are enough and keep the fans quiet.
-            cpu_threads=min(4, os.cpu_count() or 4),
-        )
-    return _models[size]
-
-
-def model_cached(size: str = MODEL_SIZE) -> bool:
-    """Whether the weights are already on disk. First run downloads them."""
-    if os.path.isdir(size):
-        return True
+def _weights_file() -> Path | None:
+    """Where the weights live, without loading the engine."""
+    if WEIGHTS:
+        return Path(WEIGHTS)
+    if local := os.environ.get("NEEDLE_WHISTLE_WEIGHTS"):
+        return Path(local)
     try:
-        from huggingface_hub.constants import HF_HUB_CACHE
+        from needle.agent import fetch
     except ImportError:  # cannot tell, so do not nag
-        return True
-    return (Path(HF_HUB_CACHE) / f"models--Systran--faster-whisper-{size}").exists()
+        return None
+    return Path(fetch.cache_dir(fetch.WHISTLE)) / fetch.base_weights(fetch.WHISTLE)
 
 
-def transcribe(audio: np.ndarray, size: str = MODEL_SIZE, language: str = "de") -> Transcript:
-    """Run Whisper over a 16 kHz mono float32 array."""
-    model = _model(size)
-    segments, _info = model.transcribe(
-        audio,
-        language=language,
-        beam_size=1,  # greedy: 1-2 s faster, and short turns do not need search
-        word_timestamps=True,
-        vad_filter=True,
-        condition_on_previous_text=False,  # one utterance, no context to inherit
+def model_cached() -> bool:
+    """Whether the weights are already on disk. First run downloads them."""
+    path = _weights_file()
+    return path is None or path.exists()
+
+
+def transcribe(audio: np.ndarray, language: str = "de") -> Transcript:
+    """Run Whistle over a 16 kHz mono float32 array."""
+    try:
+        import needle
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise STTError("cactus-needle is missing: `uv add cactus-needle`") from exc
+
+    try:
+        result = needle.transcribe(
+            audio,
+            language=language,
+            word_timestamps=True,
+            weights=WEIGHTS,
+        )
+    except Exception as exc:  # weights missing, malformed samples, engine error
+        raise STTError(f"recognition failed: {exc}") from exc
+
+    words = tuple(
+        Word(w["word"].strip(), float(w["start"]), float(w["end"]), float(w["probability"]))
+        for w in result.get("words") or ()
+        if w["word"].strip()
     )
-
-    words: list[Word] = []
-    for segment in segments:  # generator: this is where the work happens
-        for word in segment.words or ():
-            text = word.word.strip()
-            if text:
-                words.append(Word(text, float(word.start), float(word.end), float(word.probability)))
-
-    if not words:
-        raise NoSpeechError("nichts verstanden")
+    if not words:  # silence and steady noise come back empty, not invented
+        raise NoSpeechError("nothing understood")
 
     seconds = len(audio) / SAMPLE_RATE
-    return Transcript(_join(words), tuple(words), float(seconds))
+    return Transcript(result.get("text") or _join(words), words, float(seconds))
 
 
 def _join(words: Iterable[Word]) -> str:
-    """Whisper emits token-level text; glue it back into a readable sentence."""
+    """Glue token-level words back into a sentence when the engine sent no text."""
     text = " ".join(w.text for w in words)
     for punct in (",", ".", "?", "!", ";", ":", "…"):
         text = text.replace(f" {punct}", punct)

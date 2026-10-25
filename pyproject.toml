@@ -6,8 +6,9 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "beautifulsoup4>=4.15.0",
+    "cactus-needle>=3.2.8",
     "curl-cffi>=0.16.3",
-    "faster-whisper>=1.2.1",
+    "numpy>=2.5.4",
     "pydantic-ai>=2.61.0",
     "python-dotenv>=1.2.4",
     "rich>=15.0.0",

@@ -26,7 +26,7 @@ Chat in German. Type [cyan]/help[/cyan] for commands, [cyan]/quit[/cyan] to leav
 
 HELP = """\
 [bold]Commands[/bold]
-  /voice            speak one answer (microphone, local Whisper)
+  /voice            speak one answer (microphone, local Whistle)
   /mic              toggle speaking for every answer
   /level A1|A2|B1   change difficulty (resets the conversation)
   /reset            start a fresh conversation
@@ -71,7 +71,7 @@ def _is_noop_tip(tip: str) -> bool:
 # speech input
 # --------------------------------------------------------------------------- #
 def render_speech(transcript: stt.Transcript) -> None:
-    """Echo what was heard, then the speaking feedback Whisper's timings give us."""
+    """Echo what was heard, then the speaking feedback Whistle's timings give us."""
     console.print()
     console.print(f'[bold cyan]🎤[/bold cyan] [italic]“{transcript.text}”[/italic]')
 
@@ -87,23 +87,23 @@ def listen() -> str | None:
     """Record one utterance and transcribe it. None when nothing usable came back."""
     if not stt.model_cached():
         console.print(
-            f"[dim]Whisper “{stt.MODEL_SIZE}” wird einmalig geladen "
-            "(~460 MB, danach offline).[/dim]"
+            "[dim]Downloading the speech model “Whistle” once "
+            "(~17 MB, offline afterwards).[/dim]"
         )
 
     try:
-        with console.status("[dim]Sprich jetzt … (stoppt bei Stille)[/dim]", spinner="dots"):
+        with console.status("[dim]Speak now … (stops on silence)[/dim]", spinner="dots"):
             audio = stt.record()
-        with console.status("[dim]Transkribiere …[/dim]", spinner="dots"):
+        with console.status("[dim]Transcribing …[/dim]", spinner="dots"):
             transcript = stt.transcribe(audio)
     except stt.NoSpeechError:
-        console.print("[yellow]Nichts gehört — noch einmal?[/yellow]\n")
+        console.print("[yellow]Heard nothing — try again?[/yellow]\n")
         return None
     except stt.STTError as exc:
-        console.print(f"[red]Mikrofon:[/red] {exc}")
+        console.print(f"[red]Speech:[/red] {exc}")
         console.print(
-            "[dim]macOS: Systemeinstellungen → Datenschutz & Sicherheit → "
-            "Mikrofon → dein Terminal aktivieren.[/dim]\n"
+            "[dim]If this is a microphone problem on macOS: System Settings → "
+            "Privacy & Security → Microphone → enable your terminal.[/dim]\n"
         )
         return None
 
@@ -186,7 +186,7 @@ async def chat_loop(voice: bool = VOICE) -> None:
                 # the model is rebuilt with the speech caveat added or removed.
                 agent = build_agent(level, voice=voice)
                 console.print(
-                    "[dim]Voice mode on — Enter spricht.[/dim]\n"
+                    "[dim]Voice mode on — Enter to speak.[/dim]\n"
                     if voice
                     else "[dim]Voice mode off.[/dim]\n"
                 )
